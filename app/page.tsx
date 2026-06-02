@@ -322,8 +322,21 @@ export default function Home() {
 
   const handleSwap = () => {
     if (convertError) {
-      setSwapBlocked(true);
-      setTimeout(() => setSwapBlocked(false), 2500);
+      // Maybe the input is valid in the OTHER format (e.g. Python dict in JSON mode).
+      // Try converting it that way: if it works, do the swap using that conversion.
+      const altFormat: Format = inputFormat === "json" ? "python" : "json";
+      try {
+        const altRaw = convert(input, altFormat, opts);
+        // altRaw is in inputFormat's language (python→json gives JSON, json→python gives Python).
+        // After this swap: new input = altRaw, new inputFormat = inputFormat (unchanged).
+        setInput(altRaw || EXAMPLES[inputFormat]);
+        setInputFormat(inputFormat);
+        setError(null);
+        setWrap(false);
+      } catch {
+        setSwapBlocked(true);
+        setTimeout(() => setSwapBlocked(false), 2500);
+      }
       return;
     }
     const nf: Format = inputFormat === "json" ? "python" : "json";
