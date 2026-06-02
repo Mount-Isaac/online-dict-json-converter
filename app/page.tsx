@@ -5,7 +5,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import {
   EditorView, lineNumbers, highlightActiveLine,
-  highlightActiveLineGutter, keymap, drawSelection, dropCursor,
+  highlightActiveLineGutter, keymap, dropCursor,
 } from "@codemirror/view";
 import {
   history, historyKeymap, defaultKeymap, indentWithTab,
@@ -13,6 +13,7 @@ import {
 import { indentationMarkers } from "@replit/codemirror-indentation-markers";
 import {
   bracketMatching, indentOnInput, syntaxHighlighting, defaultHighlightStyle,
+  foldGutter, codeFolding, foldKeymap, foldService,
 } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { createTheme } from "@uiw/codemirror-themes";
@@ -50,19 +51,61 @@ const editorTheme = createTheme({
   ],
 });
 
+const editorLayoutTheme = EditorView.theme({
+  "&": { height: "100%" },
+  ".cm-scroller": { overflow: "auto" },
+  ".cm-foldGutter .cm-gutterElement": {
+    cursor: "pointer",
+    color: "#4a5280",
+    paddingLeft: "3px",
+    userSelect: "none",
+  },
+  ".cm-foldGutter .cm-gutterElement:hover": { color: "#7c8cf8" },
+  ".cm-foldPlaceholder": {
+    background: "#2a2f42",
+    border: "1px solid #363d54",
+    color: "#7c8cf8",
+    borderRadius: "3px",
+    padding: "0 4px",
+    cursor: "pointer",
+    fontSize: "11px",
+  },
+});
+
+// Bracket-based fold service — works for both JSON { } / [ ] and Python dict
+const bracketFold = foldService.of((state, lineStart) => {
+  const line = state.doc.lineAt(lineStart);
+  const trimmed = line.text.trimEnd();
+  if (!trimmed) return null;
+  const lastChar = trimmed[trimmed.length - 1];
+  if (lastChar !== "{" && lastChar !== "[") return null;
+  const closeChar = lastChar === "{" ? "}" : "]";
+  let depth = 1;
+  const rest = state.sliceDoc(line.to, state.doc.length);
+  for (let i = 0; i < rest.length; i++) {
+    const ch = rest[i];
+    if (ch === lastChar) depth++;
+    else if (ch === closeChar && --depth === 0) return { from: line.to, to: line.to + i };
+  }
+  return null;
+});
+
 const BASE_EXTENSIONS = [
+  editorLayoutTheme,
   lineNumbers(),
+  foldGutter(),
   highlightActiveLine(),
   highlightActiveLineGutter(),
-  drawSelection(),
   dropCursor(),
   bracketMatching(),
   closeBrackets(),
   indentOnInput(),
+  bracketFold,
+  codeFolding(),
   history(),
   syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
   indentationMarkers(),
-  keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, indentWithTab]),
+  keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, indentWithTab]),
   EditorView.lineWrapping,
 ];
 
@@ -470,12 +513,14 @@ export default function Home() {
           )}
 
           {/* CodeMirror */}
-          <div className="flex-1 min-h-0 overflow-hidden" style={{ background: "#1e2130" }}>
-            <CodeMirror value={input} onChange={handleInput}
-              theme={editorTheme} extensions={inputExtensions}
-              height="100%" style={{ height: "100%", fontSize: "13px" }}
-              placeholder={`Paste ${formatLabel(inputFormat)} here…`}
-              basicSetup={false} />
+          <div className="flex-1 min-h-0 relative" style={{ background: "#1e2130" }}>
+            <div className="absolute inset-0">
+              <CodeMirror value={input} onChange={handleInput}
+                theme={editorTheme} extensions={inputExtensions}
+                height="100%" style={{ height: "100%", fontSize: "13px" }}
+                placeholder={`Paste ${formatLabel(inputFormat)} here…`}
+                basicSetup={false} />
+            </div>
           </div>
 
           {/* error bar */}
@@ -544,12 +589,14 @@ export default function Home() {
           </div>
 
           {/* CodeMirror read-only */}
-          <div className="flex-1 min-h-0 overflow-hidden" style={{ background: "#1e2130" }}>
-            <CodeMirror value={displayOutput}
-              theme={editorTheme} extensions={outputExtensions}
-              height="100%" style={{ height: "100%", fontSize: "13px" }}
-              editable={false} basicSetup={false}
-              placeholder="Output will appear here…" />
+          <div className="flex-1 min-h-0 relative" style={{ background: "#1e2130" }}>
+            <div className="absolute inset-0">
+              <CodeMirror value={displayOutput}
+                theme={editorTheme} extensions={outputExtensions}
+                height="100%" style={{ height: "100%", fontSize: "13px" }}
+                readOnly={true} basicSetup={false}
+                placeholder="Output will appear here…" />
+            </div>
           </div>
         </div>
       </div>

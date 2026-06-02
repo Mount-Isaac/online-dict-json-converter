@@ -24,3 +24,14 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* CodeMirror editors — ensure native browser selection is visible on both
+   single-line (wrapped) and multi-line content */
+.cm-editor .cm-content ::selection,
+.cm-editor .cm-content:focus ::selection {
+  background: #3a4060;
+}
+.cm-editor .cm-line::selection,
+.cm-editor .cm-line *::selection {
+  background: #3a4060;
+}
