@@ -5,7 +5,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import {
   EditorView, lineNumbers, highlightActiveLine,
-  highlightActiveLineGutter, keymap, dropCursor,
+  highlightActiveLineGutter, keymap, dropCursor, Decoration,
 } from "@codemirror/view";
 import {
   history, historyKeymap, defaultKeymap, indentWithTab,
@@ -20,7 +20,8 @@ import { createTheme } from "@uiw/codemirror-themes";
 import { tags as t } from "@lezer/highlight";
 import {
   jsonToPythonDict, pythonDictToJson, formatJson, formatPythonDict,
-  detectFormat, type Format, type ConvertOptions,
+  detectFormat, ParseError, findAllJsonErrors,
+  type Format, type ConvertOptions,
 } from "@/lib/converter";
 
 // ── CodeMirror theme ───────────────────────────────────────────────────────
@@ -69,6 +70,15 @@ const editorLayoutTheme = EditorView.theme({
     padding: "0 4px",
     cursor: "pointer",
     fontSize: "11px",
+  },
+  ".cm-error-line": {
+    background: "rgba(239,68,68,0.18)",
+    borderLeft: "3px solid #ef4444",
+  },
+  ".cm-error-highlight": {
+    background: "rgba(239,68,68,0.42)",
+    borderBottom: "2px solid #ef4444",
+    borderRadius: "2px",
   },
 });
 
@@ -201,6 +211,7 @@ export default function Home() {
   const [showHistory, setShowHistory] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [isDragOver, setIsDragOver]   = useState(false);
+  const [swapBlocked, setSwapBlocked] = useState(false);
   const historyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSaved    = useRef<string>("");
 
@@ -209,9 +220,51 @@ export default function Home() {
 
   let rawOutput = "";
   let convertError: string | null = null;
+
+  // Each entry is the final (heuristic-applied) position for one error.
+  type ErrorMark = { from: number; to: number; lineStart: number };
+  let syntaxErrors: ErrorMark[] = [];
+
+  /** Apply the "go back one line" heuristic to a raw error position. */
+  function applyHeuristic(rawFrom: number, rawTo: number): ErrorMark {
+    let eFrom = Math.min(rawFrom, input.length);
+    let eTo   = Math.min(rawTo,   input.length);
+    let lineStart = input.lastIndexOf("\n", eFrom - 1) + 1;
+    const charsBeforeOnLine = input.slice(lineStart, eFrom);
+    if (charsBeforeOnLine.trim() === "" && lineStart > 0) {
+      const prevNl      = lineStart - 1;
+      const prevLnStart = input.lastIndexOf("\n", prevNl - 1) + 1;
+      const prevLnText  = input.slice(prevLnStart, prevNl).trimEnd();
+      const incomplete  = prevLnText.endsWith('"') || prevLnText.endsWith("'") || prevLnText.endsWith(":");
+      if (incomplete) {
+        lineStart = prevLnStart;
+        const lead = prevLnText.length - prevLnText.trimStart().length;
+        eFrom = prevLnStart + lead;
+        eTo   = prevLnStart + prevLnText.trimEnd().length;
+        if (eTo <= eFrom) { eFrom = prevLnStart; eTo = prevNl; }
+      }
+    }
+    return { from: eFrom, to: eTo, lineStart };
+  }
+
   if (input.trim()) {
     try { rawOutput = convert(input, inputFormat, opts); }
-    catch (e) { convertError = (e as Error).message; }
+    catch (e) {
+      convertError = (e as Error).message;
+      if (inputFormat === "json") {
+        // Compiler-style: collect ALL errors from the JSON source.
+        const allErrors = findAllJsonErrors(input);
+        if (allErrors.length > 0) {
+          syntaxErrors = allErrors.map(err => applyHeuristic(err.from, err.to));
+        } else if (e instanceof ParseError && (e as ParseError).from >= 0) {
+          // Fallback to the single ParseError if scanner found nothing.
+          syntaxErrors = [applyHeuristic((e as ParseError).from, (e as ParseError).to)];
+        }
+      } else if (e instanceof ParseError && (e as ParseError).from >= 0) {
+        // Python dict: single error from the recursive-descent parser.
+        syntaxErrors = [applyHeuristic((e as ParseError).from, (e as ParseError).to)];
+      }
+    }
   }
   const displayOutput = wrap ? wrapOutput(rawOutput, outputFormat) : rawOutput;
   const hasError = !!(error || convertError);
@@ -268,6 +321,11 @@ export default function Home() {
   }, [inputFormat, sortKeys, minify]);
 
   const handleSwap = () => {
+    if (convertError) {
+      setSwapBlocked(true);
+      setTimeout(() => setSwapBlocked(false), 2500);
+      return;
+    }
     const nf: Format = inputFormat === "json" ? "python" : "json";
     setInput(rawOutput || EXAMPLES[nf]);
     setInputFormat(nf);
@@ -336,8 +394,38 @@ export default function Home() {
     reader.readAsText(file);
   };
 
+  // Stable key for useMemo deps — encodes all error positions.
+  const errorsKey = syntaxErrors.map(e => `${e.lineStart}:${e.from}:${e.to}`).join("|");
+
   // ── Extensions ──
-  const inputExtensions  = useMemo(() => inputFormat  === "json" ? [...BASE_EXTENSIONS, json()] : BASE_EXTENSIONS, [inputFormat]);
+  const inputExtensions = useMemo(() => {
+    const base = inputFormat === "json" ? [...BASE_EXTENSIONS, json()] : BASE_EXTENSIONS;
+    if (syntaxErrors.length === 0) return base;
+
+    // Build decorations: one Decoration.line per unique lineStart, one
+    // Decoration.mark per unique (from, to) pair. All sorted by `from`.
+    const seenLines = new Set<number>();
+    const seenMarks = new Set<string>();
+    const allDecos: import("@codemirror/state").Range<Decoration>[] = [];
+
+    for (const err of syntaxErrors) {
+      if (!seenLines.has(err.lineStart)) {
+        seenLines.add(err.lineStart);
+        allDecos.push(Decoration.line({ class: "cm-error-line" }).range(err.lineStart));
+      }
+      const markKey = `${err.from}:${err.to}`;
+      if (err.from >= 0 && err.to > err.from && !seenMarks.has(markKey)) {
+        seenMarks.add(markKey);
+        allDecos.push(Decoration.mark({ class: "cm-error-highlight" }).range(err.from, err.to));
+      }
+    }
+
+    // Decoration.set requires ranges sorted by from, line decos before marks at the same pos.
+    allDecos.sort((a, b) => a.from !== b.from ? a.from - b.from : (a.value.spec.class === "cm-error-line" ? -1 : 1));
+
+    return [...base, EditorView.decorations.of(Decoration.set(allDecos))];
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inputFormat, errorsKey]);
   const outputExtensions = useMemo(() => outputFormat === "json" ? [...BASE_EXTENSIONS, json()] : BASE_EXTENSIONS, [outputFormat]);
 
   const detectedFormat = input.trim() ? detectFormat(input) : inputFormat;
@@ -527,18 +615,29 @@ export default function Home() {
           {hasError && (
             <div className="shrink-0 px-4 py-2 text-[11px] font-mono truncate border-t"
               style={{ background: "#2a1010", borderColor: "#5c2c2c", color: "#f87171" }}>
-              {error ?? convertError}
+              {syntaxErrors.length > 1
+                ? `${syntaxErrors.length} errors · ${convertError}`
+                : (error ?? convertError)}
             </div>
           )}
         </div>
 
         {/* ── Swap ── */}
-        <div className="flex flex-col items-center justify-center shrink-0 gap-1.5">
+        <div className="flex flex-col items-center justify-center shrink-0 gap-1.5 relative">
+          {/* blocked toast */}
+          {swapBlocked && (
+            <div className="absolute -top-10 left-1/2 -translate-x-1/2 whitespace-nowrap text-[10px] px-2.5 py-1.5 rounded-lg border z-50"
+              style={{ background: "#2a1010", borderColor: "#5c2c2c", color: "#f87171" }}>
+              Fix errors first
+            </div>
+          )}
           <button onClick={handleSwap} title="Swap input ↔ output"
             className="flex flex-col items-center gap-1 px-2.5 py-3 rounded-xl cursor-pointer transition-all border"
-            style={{ background: "#2a2f42", color: "#7c8cf8", borderColor: "#363d54" }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = "#323858"; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "#2a2f42"; }}>
+            style={convertError
+              ? { background: "#2a1a1a", color: "#7c5050", borderColor: "#5c2c2c" }
+              : { background: "#2a2f42", color: "#7c8cf8", borderColor: "#363d54" }}
+            onMouseEnter={(e) => { if (!convertError) (e.currentTarget as HTMLElement).style.background = "#323858"; }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = convertError ? "#2a1a1a" : "#2a2f42"; }}>
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
               <path d="M7 16V4m0 0L3 8m4-4 4 4" />
             </svg>
